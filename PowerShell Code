@@ -1,0 +1,520 @@
+# ============================================================
+#             SMART FILE ORGANIZER V3.2
+#                    GEKKO EDITION
+#
+#              DEV GHERBI FETHALLAH
+#                       GEKKO
+#
+#             Developed & Designed by GEKKO
+#             Copyright (c) 2026
+#                 All Rights Reserved
+#
+# ============================================================
+
+$Developer = "DEV GHERBI FETHALLAH - GEKKO"
+$Copyright = "Copyright (c) 2026 - All Rights Reserved"
+
+Add-Type -AssemblyName System.Windows.Forms
+
+$ErrorActionPreference = "Stop"
+
+$Host.UI.RawUI.WindowTitle = "Smart File Organizer V3.2 | GEKKO"
+
+# ================= BRANDING =================
+
+function Show-Brand {
+    Clear-Host
+
+    Write-Host ""
+    Write-Host "  ==============================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "       _____  ______ _  __ __  __  ____" -ForegroundColor Cyan
+    Write-Host "      / ____||  ____| |/ /|  \/  |/ __ \" -ForegroundColor Cyan
+    Write-Host "     | |  __ | |__  | ' / | \  / | |  | |" -ForegroundColor Cyan
+    Write-Host "     | | |_ ||  __| |  <  | |\/| | |  | |" -ForegroundColor Cyan
+    Write-Host "     | |__| || |____| . \ | |  | | |__| |" -ForegroundColor Cyan
+    Write-Host "      \_____||______|_|\_\|_|  |_|\____/" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "          DEV GHERBI FETHALLAH" -ForegroundColor White
+    Write-Host "                   GEKKO" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "       SMART FILE ORGANIZER V3.2" -ForegroundColor White
+    Write-Host "       Copyright (c) 2026" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  ==============================================" -ForegroundColor Cyan
+}
+
+# ================= FOLDER SELECTION =================
+
+function Select-Folder {
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = "Select folder to organize"
+    $dialog.ShowNewFolderButton = $false
+
+    if ($dialog.ShowDialog() -eq "OK") {
+        return $dialog.SelectedPath
+    }
+
+    return $null
+}
+
+# ================= SECURITY =================
+
+function Test-NoReparseInPath($Path) {
+    try {
+        $full = [IO.Path]::GetFullPath([string]$Path)
+        $root = [IO.Path]::GetPathRoot($full)
+        $current = $root
+        $relative = $full.Substring($root.Length)
+        foreach ($part in ($relative -split '[\\/]+' | Where-Object { $_ })) {
+            $current = Join-Path $current $part
+            if (Test-Path -LiteralPath $current) {
+                $node = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+                if ($node.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+            }
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
+function Test-SafeFolder($Path) {
+    try {
+        if (!(Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+        $target = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $drive = [IO.Path]::GetPathRoot($target).TrimEnd('\')
+        if ($target -eq $drive) { return $false }
+        $protected = @($env:windir, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:APPDATA, $env:LOCALAPPDATA)
+        foreach ($p in $protected) {
+            if ([string]::IsNullOrWhiteSpace($p)) { continue }
+            $p = [IO.Path]::GetFullPath($p).TrimEnd('\')
+            if ($target.Equals($p,[StringComparison]::OrdinalIgnoreCase) -or $target.StartsWith($p+'\',[StringComparison]::OrdinalIgnoreCase)) { return $false }
+        }
+        $blockedNames = @('Windows','System Volume Information','$Recycle.Bin','Recovery','WindowsApps','Config.Msi','PerfLogs','Windows.old')
+        if ((Split-Path $target -Leaf) -in $blockedNames) { return $false }
+        if ($target -match '(?i)(^|\\)\.SFO_Data(\\|$)') { return $false }
+        # Check every existing component from the volume root to the selected folder.
+        if (!(Test-NoReparseInPath $target)) { return $false }
+        return $true
+    }
+    catch { return $false }
+}
+
+# ================= SMART CATEGORIES =================
+
+function Get-Category($Extension) {
+
+    $ext = $Extension.ToLowerInvariant()
+
+    if ($ext -in @(
+        ".jpg",".jpeg",".png",".gif",".bmp",
+        ".webp",".svg",".tif",".tiff",".ico"
+    )) {
+        return "Images"
+    }
+
+    if ($ext -in @(
+        ".mp4",".mkv",".avi",".mov",
+        ".wmv",".webm",".3gp"
+    )) {
+        return "Videos"
+    }
+
+    if ($ext -in @(
+        ".mp3",".wav",".flac",".aac",
+        ".ogg",".m4a",".wma"
+    )) {
+        return "Audio"
+    }
+
+    if ($ext -in @(
+        ".pdf",".doc",".docx",".txt",".rtf",
+        ".odt",".xls",".xlsx",".csv",
+        ".ppt",".pptx"
+    )) {
+        return "Documents"
+    }
+
+    if ($ext -in @(
+        ".zip",".rar",".7z",".tar",".gz",".bz2"
+    )) {
+        return "Archives"
+    }
+
+    if ($ext -in @(
+        ".exe",".msi",".apk",".appx",".msix"
+    )) {
+        return "Installers"
+    }
+
+    if ($ext -in @(
+        ".py",".js",".ts",".html",".css",
+        ".php",".java",".kt",".cpp",".c",
+        ".cs",".json",".xml"
+    )) {
+        return "Code"
+    }
+
+    if ($ext -in @(".lnk",".url")) {
+        return "Shortcuts"
+    }
+
+    return "Others"
+}
+
+# ================= SAFE JOURNAL / INTEGRITY =================
+
+function Get-FileHashSafe($Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+}
+
+function Save-Journal($LogFile, $Journal) {
+    $directory = Split-Path -Parent $LogFile
+    if (!(Test-Path -LiteralPath $directory -PathType Container)) {
+        New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null
+    }
+    if (!(Test-NoReparseInPath $directory)) { throw 'Unsafe journal directory path (reparse point detected).' }
+    if (Test-Path -LiteralPath $LogFile) {
+        $existingLog = Get-Item -LiteralPath $LogFile -Force -ErrorAction Stop
+        if ($existingLog.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Journal file cannot be a symbolic link or junction.' }
+    }
+    $tempFile = Join-Path $directory ('.journal-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $json = ConvertTo-Json -InputObject $Journal -Depth 12
+        [IO.File]::WriteAllText($tempFile, $json, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $LogFile -PathType Leaf) {
+            [IO.File]::Replace($tempFile, $LogFile, $null)
+        } else {
+            [IO.File]::Move($tempFile, $LogFile)
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempFile) { Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Backup-PreviousJournal($LogFile, $DataDir) {
+    if (!(Test-Path -LiteralPath $LogFile -PathType Leaf)) { return $null }
+    $journalSource = Get-Item -LiteralPath $LogFile -Force -ErrorAction Stop
+    if ($journalSource.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Previous journal cannot be a symbolic link or junction.' }
+    $history = Join-Path $DataDir 'History'
+    if (!(Test-Path -LiteralPath $history -PathType Container)) { New-Item -ItemType Directory -Path $history -Force -ErrorAction Stop | Out-Null }
+    if (!(Test-NoReparseInPath $history)) { throw 'Unsafe history directory path.' }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+    $backup = Join-Path $history ("session-$stamp-" + [Guid]::NewGuid().ToString('N') + '.json')
+    Copy-Item -LiteralPath $LogFile -Destination $backup -ErrorAction Stop
+    $sourceHash = Get-FileHashSafe $LogFile
+    if ((Get-FileHashSafe $backup) -ne $sourceHash) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue; throw 'Journal backup verification failed.' }
+    return $backup
+}
+
+function Test-PathInsideTarget($Path, $Target) {
+    try {
+        $fullPath = [IO.Path]::GetFullPath([string]$Path)
+        $fullTarget = [IO.Path]::GetFullPath([string]$Target).TrimEnd('\')
+        return $fullPath.StartsWith($fullTarget + '\', [StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Test-JournalEntryPaths($Source, $Destination, $Target) {
+    if (!(Test-PathInsideTarget $Source $Target) -or !(Test-PathInsideTarget $Destination $Target)) { return $false }
+    $root = [IO.Path]::GetFullPath($Target).TrimEnd('\')
+    if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Source)).TrimEnd('\') -ne $root) { return $false }
+    $destParent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Destination))
+    if ([IO.Path]::GetDirectoryName($destParent).TrimEnd('\') -ne $root) { return $false }
+    if ([IO.Path]::GetFileName($destParent) -eq '.SFO_Data') { return $false }
+    if (!(Test-NoReparseInPath $root)) { return $false }
+    if (Test-Path -LiteralPath $destParent -PathType Container) {
+        if (!(Test-NoReparseInPath $destParent)) { return $false }
+    }
+    return $true
+}
+
+function Undo-LastSession($LogFile, $Target) {
+    if (Test-Path -LiteralPath $LogFile) {
+        $journalItem = Get-Item -LiteralPath $LogFile -Force -ErrorAction Stop
+        if ($journalItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { Write-Host 'Journal path is unsafe (reparse point). No changes made.' -ForegroundColor Red; return }
+    }
+    if (!(Test-Path -LiteralPath $LogFile -PathType Leaf)) { Write-Host 'No previous session found.' -ForegroundColor Yellow; return }
+    try {
+        $journal = Get-Content -LiteralPath $LogFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if (!$journal -or $null -eq $journal.PSObject.Properties['Moves'] -or $null -eq $journal.PSObject.Properties['SessionId']) { throw 'Unsupported journal schema.' }
+        if ([IO.Path]::GetFullPath([string]$journal.Target).TrimEnd('\') -ne [IO.Path]::GetFullPath([string]$Target).TrimEnd('\')) { throw 'Journal target mismatch.' }
+        $entries = @($journal.Moves)
+        $ids = @($entries | ForEach-Object { [string]$_.OperationId })
+        if (($ids | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0 -or ($ids | Select-Object -Unique).Count -ne $ids.Count) { throw 'Journal contains missing or duplicate operation IDs.' }
+    } catch { Write-Host 'Undo history is invalid or unsafe. No changes made.' -ForegroundColor Red; Write-Host $_.Exception.Message -ForegroundColor DarkRed; return }
+
+    if ($entries.Count -eq 0) { Write-Host 'Nothing to undo.' -ForegroundColor Yellow; return }
+    Write-Host "`nVerifying and restoring previous session..." -ForegroundColor Cyan
+    $restored = 0; $unresolved = 0
+    for ($i = $entries.Count - 1; $i -ge 0; $i--) {
+        $entry = $entries[$i]
+        $source = [string]$entry.Source; $destination = [string]$entry.Destination
+        try {
+            if (!(Test-JournalEntryPaths $source $destination $Target)) { throw 'Unsafe source/destination path.' }
+            $expected = [string]$entry.SHA256
+            if ($expected -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Missing or invalid SHA-256 fingerprint.' }
+            $srcExists = Test-Path -LiteralPath $source -PathType Leaf
+            $dstExists = Test-Path -LiteralPath $destination -PathType Leaf
+            if ($srcExists -and $dstExists) { throw 'Both source and destination exist; refusing to overwrite either file.' }
+            if ($srcExists) {
+                if ((Get-FileHashSafe $source) -ne $expected) { throw 'Source exists but its SHA-256 does not match the recorded file.' }
+                # Source hash matches: operation never moved, or it was already restored.
+            } elseif ($dstExists) {
+                if ((Get-FileHashSafe $destination) -ne $expected) { throw 'Destination SHA-256 mismatch; refusing to restore an unknown file.' }
+                # File.Move fails if source reappears, so no overwrite is possible.
+                [IO.File]::Move($destination, $source)
+                if ((Get-FileHashSafe $source) -ne $expected) { throw 'Post-restore integrity verification failed.' }
+                $restored++
+                Write-Host "Restored: $(Split-Path $source -Leaf)" -ForegroundColor Green
+            } else { throw 'File missing from both source and destination.' }
+
+            $entry.Status = 'RestoredOrNotMoved'
+            $entry.ResolvedAt = (Get-Date).ToString('o')
+            $candidateEntries = @($entries | Where-Object { [string]$_.OperationId -ne [string]$entry.OperationId })
+            $journal.Moves = @($candidateEntries)
+            Save-Journal $LogFile $journal
+            # Commit in-memory removal only after the durable journal save succeeds.
+            $entries = @($candidateEntries)
+        } catch {
+            $unresolved++
+            $entry.Status = 'RecoveryRequired'
+            $entry.LastError = $_.Exception.Message
+            $entry.LastAttemptAt = (Get-Date).ToString('o')
+            $journal.Moves = @($entries)
+            try { Save-Journal $LogFile $journal } catch { Write-Host 'CRITICAL: could not persist recovery state; preserve the journal file manually.' -ForegroundColor Red }
+            Write-Host "Not restored: $(Split-Path $source -Leaf) - $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    $journal.Moves = @($entries)
+    if ($entries.Count -eq 0) {
+        $journal.CompletedAt = (Get-Date).ToString('o')
+        Save-Journal $LogFile $journal
+        $history = Join-Path (Split-Path -Parent $LogFile) 'History'
+        if (Test-Path -LiteralPath $history -PathType Container) {
+            $completed = Join-Path $history ("undone-" + [string]$journal.SessionId + '.json')
+            try { Copy-Item -LiteralPath $LogFile -Destination $completed -Force -ErrorAction Stop } catch { Write-Host 'Warning: completed session archive could not be written.' -ForegroundColor Yellow }
+        }
+        Remove-Item -LiteralPath $LogFile -Force -ErrorAction Stop
+        Write-Host "`nUndo completed. All operations verified." -ForegroundColor Green
+    } else {
+        Save-Journal $LogFile $journal
+        Write-Host "`nUndo incomplete. Remaining operations are saved for recovery." -ForegroundColor Yellow
+    }
+    Write-Host "Restored: $restored files" -ForegroundColor Green
+    Write-Host "Unresolved: $($entries.Count) operations" -ForegroundColor Yellow
+}
+
+# ================= MAIN =================
+
+Show-Brand
+
+Write-Host "`n1. Organize files"
+Write-Host "2. Undo last session"
+Write-Host "3. Exit"
+
+$choice = Read-Host "`nChoose option"
+
+if ($choice -notin @("1","2")) {
+    exit
+}
+
+$target = Select-Folder
+
+if (!$target) {
+    Write-Host "No folder selected."
+    exit
+}
+
+if (!(Test-SafeFolder $target)) {
+
+    Write-Host "`nSECURITY BLOCK!" -ForegroundColor Red
+    Write-Host "This folder is protected or unsafe."
+    Read-Host "`nPress Enter"
+    exit
+}
+
+$dataDir = Join-Path $target ".SFO_Data"
+$logFile = Join-Path $dataDir "last-session.json"
+
+# Never follow a pre-existing junction/symlink for the organizer's own data.
+if (Test-Path -LiteralPath $dataDir) {
+    $dataDirItem = Get-Item -LiteralPath $dataDir -Force
+    if (($dataDirItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        !($dataDirItem.Attributes -band [IO.FileAttributes]::Directory)) {
+        Write-Host "`nSECURITY BLOCK: .SFO_Data is not a safe directory." -ForegroundColor Red
+        Read-Host "`nPress Enter"
+        exit
+    }
+}
+
+# ================= UNDO MENU =================
+
+if ($choice -eq "2") {
+
+    Undo-LastSession $logFile $target
+
+    Read-Host "`nPress Enter"
+    exit
+}
+
+# ================= SORTING MODE =================
+
+Write-Host "`nSorting mode:"
+Write-Host "1. By extension"
+Write-Host "2. By smart category"
+
+$mode = Read-Host "Choose mode"
+
+if ($mode -notin @("1","2")) {
+    exit
+}
+
+# Preserve warning about previous undo history
+if (Test-Path -LiteralPath $logFile) {
+
+    Write-Host "`nWARNING: Previous undo history exists." -ForegroundColor Yellow
+
+    $replace = Read-Host "Continue and replace previous history? (Y/N)"
+
+    if ($replace -notmatch '^(Y|YES)$') { exit }
+    try {
+        $backupPath = Backup-PreviousJournal $logFile $dataDir
+        if ($backupPath) { Write-Host "Previous session backed up: $backupPath" -ForegroundColor Green }
+    } catch {
+        Write-Host "Cannot safely archive previous session. New organization cancelled." -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor DarkRed
+        Read-Host "Press Enter"
+        exit
+    }
+}
+
+# ================= BUILD PLAN =================
+
+$files = @(Get-ChildItem -LiteralPath $target -File -Force)
+
+$plan = @()
+
+$scriptPath = $PSCommandPath
+$launcherPath = Join-Path $PSScriptRoot "Run.bat"
+
+foreach ($file in $files) {
+
+    if ($file.FullName -eq $scriptPath) { continue }
+    if ($file.FullName -eq $launcherPath) { continue }
+
+    if (
+        ($file.Attributes -band [IO.FileAttributes]::Hidden) -or
+        ($file.Attributes -band [IO.FileAttributes]::System) -or
+        ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)
+    ) {
+        continue
+    }
+
+    if ($file.Extension -eq "") {
+        $folder = "No Extension"
+    }
+    elseif ($mode -eq "1") {
+        $folder = $file.Extension.ToLowerInvariant()
+    }
+    else {
+        $folder = Get-Category $file.Extension
+    }
+
+    $destinationFolder = Join-Path $target $folder
+    $destination = Join-Path $destinationFolder $file.Name
+
+    if (Test-Path -LiteralPath $destination) {
+        continue
+    }
+
+    if (Test-Path -LiteralPath $destinationFolder -PathType Leaf) {
+        continue
+    }
+
+    if (Test-Path -LiteralPath $destinationFolder -PathType Container) {
+        $destinationFolderItem = Get-Item -LiteralPath $destinationFolder -Force
+        if ($destinationFolderItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            continue
+        }
+    }
+
+    $plan += [PSCustomObject]@{
+        Source = $file.FullName
+        Destination = $destination
+        Name = $file.Name
+        Folder = $folder
+    }
+}
+
+# ================= PRE-FLIGHT VALIDATION =================
+
+$validatedPlan = @()
+$destinationKeys = @{}
+$preflightFailed = 0
+foreach ($candidate in $plan) {
+    try {
+        if (!(Test-Path -LiteralPath $candidate.Source -PathType Leaf)) { throw 'Source file is missing.' }
+        if (!(Test-JournalEntryPaths $candidate.Source $candidate.Destination $target)) { throw 'Unsafe path or reparse point detected.' }
+        if (Test-Path -LiteralPath $candidate.Destination) { throw 'Destination already exists.' }
+        $key = [IO.Path]::GetFullPath($candidate.Destination).ToLowerInvariant()
+        if ($destinationKeys.ContainsKey($key)) { throw 'Duplicate destination in execution plan.' }
+        $destinationKeys[$key] = $true
+        $candidate | Add-Member -NotePropertyName PreflightSHA256 -NotePropertyValue (Get-FileHashSafe $candidate.Source) -Force
+        $validatedPlan += $candidate
+    } catch {
+        $preflightFailed++
+        Write-Host "Preflight skipped: $($candidate.Name) - $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+$plan = @($validatedPlan)
+Write-Host "Preflight passed: $($plan.Count) | Rejected: $preflightFailed" -ForegroundColor Cyan
+
+# ================= PREVIEW =================
+
+Write-Host "`n========== PREVIEW ==========" -ForegroundColor Cyan
+
+foreach ($item in $plan) {
+    Write-Host "$($item.Name) -> $($item.Folder)"
+}
+
+Write-Host "`nFiles to move: $($plan.Count)" -ForegroundColor Green
+Write-Host "Skipped files: $($files.Count - $plan.Count)"
+
+if ($plan.Count -eq 0) {
+    Read-Host "`nPress Enter"
+    exit
+}
+
+$confirm = Read-Host "`nProceed? (Y/N)"
+
+if ($confirm -notmatch '^(Y|YES)$') {
+    Write-Host "Operation cancelled." -ForegroundColor Yellow
+    Read-Host "Press Enter"
+    exit
+}
+
+# ================= JOURNAL INITIALIZATION =================
+
+try {
+    if (!(Test-Path -LiteralPath $dataDir -PathType Container)) { New-Item -ItemType Directory -Path $dataDir -Force -ErrorAction Stop | Out-Null }
+    if (!(Test-NoReparseInPath $dataDir)) { throw 'Unsafe .SFO_Data and inspect recovery.' -ForegroundColor Red }
+
+# ================= FINISH =================
+
+Write-Host "`n============================================" -ForegroundColor Cyan
+Write-Host "          ORGANIZATION COMPLETE" -ForegroundColor Green
+Write-Host "============================================" -ForegroundColor Cyan
+
+Write-Host "Moved: $moved"
+Write-Host "Failed: $failed"
+Write-Host "Skipped during execution: $skipped"
+Write-Host "Recovery journal: $logFile"
+Write-Host ""
+
+Write-Host "DEV GHERBI FETHALLAH" -ForegroundColor White
+Write-Host "GEKKO" -ForegroundColor Cyan
+Write-Host "Copyright (c) 2026 - All Rights Reserved." -ForegroundColor DarkGray
+
+Read-Host "`nPress Enter to exit"
